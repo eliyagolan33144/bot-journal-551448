@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f2741">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>יומן הבוט</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root { --bg: #0b1220; --card: #131c2e; --ink: #e6ecf5; --muted: #93a1b8; --line: #24324a;
+          --accent: #34d399; --bad: #f87171; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 "Segoe UI", Roboto, "Noto Sans Hebrew", Arial, sans-serif; }
+  .screen { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 32px 20px calc(32px + env(safe-area-inset-bottom)); text-align: center; }
+  .logo { width: 84px; height: 84px; border-radius: 20px; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  h1 { font-size: 22px; margin: 18px 0 4px; font-weight: 650; }
+  p.sub { color: var(--muted); margin: 0 0 22px; font-size: 14.5px; max-width: 340px; }
+  .dots { display: flex; gap: 14px; justify-content: center; margin: 6px 0 10px; direction: ltr; }
+  .dots span { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--muted); transition: .15s; }
+  .dots span.on { background: var(--accent); border-color: var(--accent); }
+  .msg { min-height: 22px; font-size: 14px; color: var(--muted); margin-bottom: 8px; }
+  .msg.err { color: var(--bad); }
+  .pad { display: grid; grid-template-columns: repeat(3, 76px); gap: 14px; direction: ltr; margin-top: 6px; }
+  .pad button { height: 76px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    font-size: 26px; font-family: inherit; cursor: pointer; }
+  .pad button:active { background: #1d2a44; }
+  .pad button.ghost { background: transparent; border-color: transparent; font-size: 15px; color: var(--muted); }
+  #app { display: none; position: fixed; inset: 0; background: var(--bg); }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center;
+    gap: 8px; padding: 8px 14px calc(8px + env(safe-area-inset-bottom)); background: rgba(11,18,32,.94);
+    border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); z-index: 2; }
+  #bar button { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 999px;
+    padding: 6px 14px; font: inherit; font-size: 13px; }
+  iframe { border: 0; width: 100%; height: 100%; padding-bottom: 52px; background: var(--bg); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="screen" id="lock">
+  <img class="logo" src="icon-192.png" alt="">
+  <h1 id="title">יומן הבוט</h1>
+  <p class="sub" id="sub">מכין...</p>
+  <div class="dots" id="dots"></div>
+  <div class="msg" id="msg"></div>
+  <div class="pad" id="pad"></div>
+</div>
+<div id="app">
+  <iframe id="view" title="יומן הבוט"></iframe>
+  <div id="bar"><span id="updated"></span><span><button id="refresh">רענון</button> <button id="lockbtn">נעילה</button></span></div>
+</div>
+<script>
+"use strict";
+// ----- storage: the journal key, wrapped (encrypted) with the entry code. Never stored in the clear. -----
+const STORE = "bj-wrapped-key", FAILS = "bj-fails", MAX_FAILS = 10, PIN_LEN = 6, ITER = 310000;
+const te = new TextEncoder(), td = new TextDecoder();
+const $ = (id) => document.getElementById(id);
+const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const b64e = (u) => btoa(String.fromCharCode(...u));
+let journalKey = null, hiddenAt = 0;
+
+function fromUrlSafe(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return b64d(s);
+}
+
+async function pinKey(pin, salt) {
+  const base = await crypto.subtle.importKey("raw", te.encode(pin), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: ITER, hash: "SHA-256" }, base,
+    { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+async function wrapAndStore(key, pin) {
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await pinKey(pin, salt), key));
+  localStorage.setItem(STORE, JSON.stringify({ salt: b64e(salt), iv: b64e(iv), data: b64e(data) }));
+  localStorage.setItem(FAILS, "0");
+}
+
+async function unwrap(pin) {
+  const w = JSON.parse(localStorage.getItem(STORE));
+  const k = await pinKey(pin, b64d(w.salt));
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64d(w.iv) }, k, b64d(w.data)));
+}
+
+// ----- the journal file: same construction as bot/mobile_crypto.py (HMAC-SHA256 CTR + HMAC tag) -----
+async function hmacKey(raw) {
+  return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+async function sign(k, data) { return new Uint8Array(await crypto.subtle.sign("HMAC", k, data)); }
+function concat(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+async function decryptBox(key, box) {
+  if (box.v !== 1) throw new Error("version");
+  const master = await hmacKey(key);
+  const encKey = await hmacKey(await sign(master, te.encode("bot-journal enc v1")));
+  const macKey = await hmacKey(await sign(master, te.encode("bot-journal mac v1")));
+  const nonce = b64d(box.nonce), ct = b64d(box.ct), tag = b64d(box.tag);
+  const expect = await sign(macKey, concat(te.encode("v1"), nonce, ct));
+  let diff = expect.length ^ tag.length;
+  for (let i = 0; i < Math.min(expect.length, tag.length); i++) diff |= expect[i] ^ tag[i];
+  if (diff) throw new Error("tag");
+  const out = new Uint8Array(ct.length), blocks = [];
+  for (let i = 0; i * 32 < ct.length; i++) {
+    const ctr = new Uint8Array(4); new DataView(ctr.buffer).setUint32(0, i);
+    blocks.push(sign(encKey, concat(nonce, ctr)));
+  }
+  const ks = await Promise.all(blocks);
+  for (let i = 0; i < ct.length; i++) out[i] = ct[i] ^ ks[i >> 5][i & 31];
+  return td.decode(out);
+}
+window.__decryptBox = decryptBox; // used by the automated test page only
+
+// ----- screens -----
+function pinPad(onDone) {
+  let pin = "";
+  const dots = $("dots"), pad = $("pad");
+  const draw = () => { dots.innerHTML = ""; for (let i = 0; i < PIN_LEN; i++) {
+    const s = document.createElement("span"); if (i < pin.length) s.className = "on"; dots.appendChild(s); } };
+  pad.innerHTML = "";
+  ["1","2","3","4","5","6","7","8","9","","0","⌫"].forEach((d) => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = d;
+    if (d === "") { b.className = "ghost"; b.disabled = true; }
+    b.addEventListener("click", () => {
+      if (d === "⌫") pin = pin.slice(0, -1);
+      else if (pin.length < PIN_LEN) pin += d;
+      draw();
+      if (pin.length === PIN_LEN) { const p = pin; pin = ""; setTimeout(() => { draw(); onDone(p); }, 120); }
+    });
+    pad.appendChild(b);
+  });
+  draw();
+}
+function say(title, sub, msg, err) {
+  $("title").textContent = title; $("sub").textContent = sub;
+  $("msg").textContent = msg || ""; $("msg").className = "msg" + (err ? " err" : "");
+}
+function showLock() { $("app").style.display = "none"; $("lock").classList.remove("hidden"); }
+
+function pairing(key) {
+  say("חיבור הטלפון", "בחר קוד כניסה בן 6 ספרות. תצטרך אותו בכל כניסה לאפליקציה.");
+  pinPad((first) => {
+    say("חיבור הטלפון", "הקש שוב את אותו קוד לאישור.");
+    pinPad(async (second) => {
+      if (first !== second) { say("חיבור הטלפון", "בחר קוד כניסה בן 6 ספרות.", "הקודים לא תואמים. נסה שוב.", true); return pairing(key); }
+      say("חיבור הטלפון", "שומר...");
+      await wrapAndStore(key, first);
+      history.replaceState(null, "", location.pathname);  // the key leaves the address bar for good
+      journalKey = key;
+      openApp();
+    });
+  });
+}
+
+function askPin() {
+  const fails = +(localStorage.getItem(FAILS) || 0);
+  say("יומן הבוט", "הקש את קוד הכניסה", fails ? `קוד שגוי. נותרו ${MAX_FAILS - fails} ניסיונות.` : "", fails > 0);
+  pinPad(async (pin) => {
+    say("יומן הבוט", "בודק...");
+    try {
+      journalKey = await unwrap(pin);
+      localStorage.setItem(FAILS, "0");
+      openApp();
+    } catch (e) {
+      const n = +(localStorage.getItem(FAILS) || 0) + 1;
+      localStorage.setItem(FAILS, String(n));
+      if (n >= MAX_FAILS) {
+        localStorage.removeItem(STORE);
+        say("האפליקציה ננעלה", "יותר מדי ניסיונות שגויים. המפתח נמחק מהטלפון. כדי להתחבר שוב, סרוק את קוד ה-QR מהמחשב.", "", true);
+        $("pad").innerHTML = ""; $("dots").innerHTML = "";
+        return;
+      }
+      askPin();
+    }
+  });
+}
+
+async function load() {
+  $("updated").textContent = "טוען...";
+  try {
+    const r = await fetch("data.enc?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("http " + r.status);
+    const html = await decryptBox(journalKey, await r.json());
+    $("view").srcdoc = html;
+    $("updated").textContent = "נטען " + new Date().toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    $("updated").textContent = "אין חיבור או שהנתונים עוד לא עלו. נסה רענון.";
+  }
+}
+
+function openApp() {
+  $("lock").classList.add("hidden");
+  $("app").style.display = "block";
+  load();
+}
+
+$("refresh").addEventListener("click", load);
+$("lockbtn").addEventListener("click", () => { journalKey = null; $("view").srcdoc = ""; showLock(); askPin(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (journalKey && Date.now() - hiddenAt > 5 * 60 * 1000) {   // away 5+ minutes: lock again
+    journalKey = null; $("view").srcdoc = ""; showLock(); askPin();
+  } else if (journalKey) load();
+});
+setInterval(() => { if (journalKey && !document.hidden) load(); }, 5 * 60 * 1000);
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
+(function start() {
+  if (!window.crypto || !crypto.subtle) { say("יומן הבוט", "הדפדפן הזה לא תומך בהצפנה. פתח ב-Chrome."); return; }
+  const m = location.hash.match(/k=([A-Za-z0-9_-]{43})/);
+  if (m) { const k = fromUrlSafe(m[1]); if (k.length === 32) return pairing(k); }
+  if (localStorage.getItem(STORE)) return askPin();
+  say("יומן הבוט", "הטלפון עוד לא מחובר. במחשב הרץ את חיבור הטלפון וסרוק את קוד ה-QR עם המצלמה.");
+})();
+</script>
+</body>
+</html>
